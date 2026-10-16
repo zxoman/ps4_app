@@ -1,0 +1,14 @@
+; /data/GoldHEN/plugins.ini
+;
+; Load plugins for every title (games and apps). The lockall plugin needs to
+; be in [default] so that whichever title is running hosts the TCP server and
+; the monitor that enforces the lock.
+;
+; A bare path means "enabled". You may also write  path=true  /  path=false.
+
+[default]
+/data/GoldHEN/plugins/lockall.prx
+
+; You can scope additional plugins per title id as usual:
+; [CUSA00001]
+; /data/GoldHEN/plugins/afr.prx

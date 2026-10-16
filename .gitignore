@@ -1,0 +1,5 @@
+lockall_plugin/build/
+*.elf
+*.oelf
+*.o
+*.so
