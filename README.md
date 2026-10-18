@@ -4,8 +4,9 @@ A GoldHEN plugin (`.prx`) plus a small Python PC client that lets you lock or
 unlock **all** retail games on a jailbroken PS4 over Wi-Fi.
 
 - Plugin: background TCP server on port **9095** (not 9090 - that is GoldHEN's
-  BinLoader), token authentication, on-screen notifications, closes any running
-  game (`CUSA*`) while locked, and persists its state across reboot/rest mode.
+  BinLoader), token authentication, on-screen notifications, and while locked it
+  **sends the user back to the home screen** (the game is suspended, not killed)
+  for any retail game (`CUSA*`). State persists across reboot/rest mode.
 - Client: `ps4lock.py lock|unlock|status`.
 
 > Firmware / GoldHEN used while writing this: **9.00 / GoldHEN 2.4b18.6**
@@ -44,7 +45,8 @@ or app you launch.
   if the listener process exits another instance takes over automatically.
 - The **monitor** in each instance checks every 500 ms: if the state is
   *locked* **and** this process is a retail game (`CUSA*`), it shows
-  "Games are locked" and closes the game.
+  "Games are locked" and sends the user back to the home screen. Re-opening the
+  game just bounces the user home again while the lock is on.
 
 **Limitation to be aware of:** because plugins only exist inside launched
 titles, the TCP server is reachable while a GoldHEN-injected title (a game or
@@ -185,30 +187,39 @@ Expected replies:
 - Usually the same reachability issue as *connection refused*.
 - Increase `--timeout` if the console is busy.
 
-### The game isn't being closed
+### The game isn't being sent home
 
 - Only title ids starting with `CUSA` are targeted. Games from other regions
-  use `PLAS`/`PCAS`/`PPSA` etc. and are **not** closed by this build; edit
-  `is_game()` in `source/main.c` if you need other prefixes.
-- The plugin first tries `sceSystemServiceKillApp`. If the firmware rejects
-  it, it falls back to `sceSystemServiceNavigateToGoHome` (which suspends the
-  game to the background rather than tearing it down), and finally to killing
-  its own pid if it runs inside the game process.
-- If closing never happens, the monitor instance may not be running inside the
-  game process. Ensure the plugin is in `[default]`.
+  use `PLAS`/`PCAS`/`PPSA`, and **homebrew apps** use `BREW*` etc.; those are
+  deliberately **not** touched by this build. Edit `is_game()` in
+  `source/main.c` if you need other prefixes.
+- The plugin calls `sceSystemServiceNavigateToGoHome()` to send the user back to
+  the home screen (the game stays suspended). If that entry point cannot be
+  resolved it falls back to `sceSystemServiceKillApp(appid, 0, 0x20000, 0)`, the
+  system's own "close, then show home" path.
+- If nothing happens, the monitor instance may not be running inside the game
+  process. Ensure the plugin is in `[default]`.
 
 ### Firmware differences
 
 - The GoldHEN SDK uses syscall 500 for its RPC; it exists on all GoldHEN
   builds that ship the plugin SDK (2.3+).
-- `sceSystemServiceKillApp` argument conventions are the main firmware-varying
-  piece. This plugin calls `KillApp(appid, 0, 0x20000, 0)` (the "close to home
-  screen" method) and falls back gracefully if the return value is non-zero.
 - `libSceSystemService.sprx` is loaded at runtime via
-  `sys_dynlib_load_prx`, the same approach the official `button_swap` plugin
-  uses, so no link-time dependency is baked in.
+  `sys_dynlib_load_prx` + `sys_dynlib_dlsym`, the same approach the official
+  `button_swap` plugin uses, so no link-time dependency is baked in.
 - Lowest realistic target: GoldHEN 2.3 (first release with the plugin SDK).
-  Tested by the author only insofar as it compiles/links - see below.
+
+### Implementation notes (learned the hard way)
+
+- `module_start` / `module_stop` must be **no-ops**. They run from
+  `sceKernelLoadStartModule` before the loader calls `plugin_load`; creating
+  threads or doing I/O there crashes the host title. All work happens in
+  `plugin_load`.
+- **stdio file calls (`fopen`/`fread`/...) crash** the host title with a SIGBUS
+  inside the kernel `copyin` path when a plugin runs inside a game process. Use
+  the raw `sceKernelOpen` / `sceKernelRead` / `sceKernelWrite` / `sceKernelClose`
+  syscalls instead (the GoldHEN plugin loader does the same for its own
+  `plugins.ini`).
 
 ---
 
@@ -217,12 +228,12 @@ Expected replies:
 - **Compiled and linked successfully** against the real OpenOrbis toolchain
   headers, the GoldHEN Plugins SDK, and `clang`/`ld.lld`, producing a valid
   PS4 SELF (`.prx`) with `plugin_load` / `plugin_unload` exported.
-- **Not tested on real PS4 hardware.** The following are unverified:
-  - actual runtime behaviour of `sceSystemServiceKillApp` on your firmware,
-  - whether the TCP server stays reachable at the home screen,
-  - notifications, rest-mode persistence, and thread teardown timing.
-- The Python client logic is straightforward but was not run against a live
-  plugin.
+- **Tested on real PS4 hardware**: the plugin loads into a launched title
+  without crashing, logs `listening on port 9095`, and the client's
+  `lock` / `unlock` / `status` commands all round-trip correctly (bad token →
+  `ERR`). The state file persists.
+- Still unverified on hardware: the go-home enforcement against an actual
+  retail `CUSA*` game, rest-mode persistence, and thread teardown timing.
 
 If something misbehaves, the `[lockall]` klog lines will say what the plugin
 decided and which function pointers it resolved.

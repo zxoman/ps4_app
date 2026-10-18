@@ -127,26 +127,40 @@ static void notify(const char *msg) {
 }
 
 /* ------------------------------------------------------------------ */
-/* state file                                                         */
+/* file IO                                                            */
+/*                                                                    */
+/* stdio (fopen/fread/...) is NOT safe here: inside a plugin injected  */
+/* into a game process it faults in the kernel copyin path (SIGBUS).   */
+/* The GoldHEN plugin loader uses the raw sceKernel* file syscalls for */
+/* the very same /data files for this reason, so we do too.            */
 /* ------------------------------------------------------------------ */
+static int read_file(const char *path, char *buf, size_t buflen) {
+    int fd = sceKernelOpen(path, O_RDONLY, 0);
+    if (fd < 0) return -1;
+
+    size_t n = sceKernelRead(fd, buf, buflen - 1);
+    sceKernelClose(fd);
+
+    if (n == 0 || n >= buflen) return -1;
+    buf[n] = '\0';
+    return (int)n;
+}
+
 static int load_locked(void) {
-    FILE *f = fopen(STATE_PATH, "r");
-    if (!f) return 0;
-    int v = 0;
-    if (fscanf(f, "%d", &v) != 1) v = 0;
-    fclose(f);
-    return v ? 1 : 0;
+    char buf[16];
+    if (read_file(STATE_PATH, buf, sizeof(buf)) < 0) return 0;
+    return buf[0] == '1' ? 1 : 0;
 }
 
 static void save_locked(int locked) {
-    FILE *f = fopen(STATE_PATH, "w");
-    if (!f) {
-        logf_("cannot write state file %s\n", STATE_PATH);
+    int fd = sceKernelOpen(STATE_PATH, O_WRONLY | O_CREAT | O_TRUNC, 0777);
+    if (fd < 0) {
+        logf_("cannot write state file %s (0x%08x)\n", STATE_PATH, fd);
         return;
     }
-    fprintf(f, "%d\n", locked ? 1 : 0);
-    fflush(f);
-    fclose(f);
+    char b[4] = { locked ? '1' : '0', '\n', 0, 0 };
+    sceKernelWrite(fd, b, 2);
+    sceKernelClose(fd);
 }
 
 /* ------------------------------------------------------------------ */
@@ -156,24 +170,23 @@ static void load_token(char *out, size_t outlen) {
     strncpy(out, DEFAULT_TOKEN, outlen - 1);
     out[outlen - 1] = '\0';
 
-    FILE *f = fopen(TOKEN_PATH, "r");
-    if (!f) return;
+    char buf[512];
+    if (read_file(TOKEN_PATH, buf, sizeof(buf)) < 0) return;
 
-    char line[256];
-    if (fgets(line, sizeof(line), f)) {
-        line[strcspn(line, "\r\n")] = '\0';
-        char *val = line;
-        char *eq = strchr(line, '=');
-        if (eq) val = eq + 1;
-        while (*val == ' ' || *val == '\t') val++;
-        size_t len = strlen(val);
-        while (len && (val[len - 1] == ' ' || val[len - 1] == '\t')) val[--len] = '\0';
-        if (*val) {
-            strncpy(out, val, outlen - 1);
-            out[outlen - 1] = '\0';
-        }
+    /* only look at the first line */
+    char *nl = strpbrk(buf, "\r\n");
+    if (nl) *nl = '\0';
+
+    char *val = buf;
+    char *eq = strchr(buf, '=');
+    if (eq) val = eq + 1;
+    while (*val == ' ' || *val == '\t') val++;
+    size_t len = strlen(val);
+    while (len && (val[len - 1] == ' ' || val[len - 1] == '\t')) val[--len] = '\0';
+    if (*val) {
+        strncpy(out, val, outlen - 1);
+        out[outlen - 1] = '\0';
     }
-    fclose(f);
 }
 
 /* ------------------------------------------------------------------ */
@@ -216,38 +229,30 @@ static int is_protected_process(void) {
 }
 
 /* ------------------------------------------------------------------ */
-/* closing the running game                                           */
+/* kicking the user out of the running game                           */
+/*                                                                    */
+/* The lock does NOT terminate the title: it sends the user back to    */
+/* the home screen (the game stays suspended in the background). The   */
+/* monitor keeps doing this while the lock is on, so re-opening the    */
+/* game just bounces the user home again.                              */
 /* ------------------------------------------------------------------ */
-static void close_game(void) {
+static void exit_to_home(void) {
     load_system_service();
 
-    int32_t appid = p_GetBigApp ? p_GetBigApp() : -1;
-
-    if (appid > 0 && p_KillApp) {
-        /* method 0x20000 is the "close and return to the home screen"
-         * behaviour used by the system's own close-app path. If the
-         * firmware rejects it we fall through to the home button path. */
-        int32_t ret = p_KillApp((uint32_t)appid, 0, 0x20000, 0);
-        if (ret == 0) {
-            logf_("closed app 0x%08x via sceSystemServiceKillApp\n", appid);
-            return;
-        }
-        logf_("sceSystemServiceKillApp(0x%08x) = 0x%08x, falling back\n", appid, ret);
-    }
-
-    /* fallback: simulate the PS button -> go home. The title stays
-     * suspended in the background rather than being torn down, but the
-     * lock's monitor will keep pushing the user out of it. */
     if (p_GoHome) {
-        logf_("falling back to sceSystemServiceNavigateToGoHome()\n");
         p_GoHome();
+        logf_("navigated to the home screen\n");
+        return;
     }
 
-    /* last resort: if we are running inside the game process itself,
-     * terminating our own pid also removes the game. */
-    if (appid <= 0) {
-        logf_("last resort: killing own pid %d\n", (int)getpid());
-        kill(getpid(), SIGKILL);
+    /* last resort if the go-home entry point could not be resolved:
+     * method 0x20000 is the system's own "close, then show home" path. */
+    int32_t appid = p_GetBigApp ? p_GetBigApp() : -1;
+    if (appid > 0 && p_KillApp) {
+        int32_t ret = p_KillApp((uint32_t)appid, 0, 0x20000, 0);
+        logf_("go-home unavailable, KillApp(0x%08x) = 0x%08x\n", appid, ret);
+    } else {
+        logf_("no way to leave the game (go-home and kill both unavailable)\n");
     }
 }
 
@@ -401,9 +406,8 @@ static void *monitor_thread(void *arg) {
         if (load_locked()) {
             if (self_is_game && !is_protected_process()) {
                 notify("Games are locked");
-                close_game();
-                /* cooldown: avoid notification/kill spam while the
-                 * system tears the title down */
+                exit_to_home();
+                /* cooldown: avoid notification/go-home spam */
                 sceKernelUsleep(2000 * 1000);
             }
         }
@@ -457,11 +461,9 @@ int32_t attr_public plugin_load(int32_t argc, const char* argv[]) {
     load_system_service();
 
     /* make sure the state file exists so a fresh install is well-defined */
-    FILE *f = fopen(STATE_PATH, "r");
-    if (!f) {
+    char probe[8];
+    if (read_file(STATE_PATH, probe, sizeof(probe)) < 0) {
         save_locked(0);
-    } else {
-        fclose(f);
     }
 
     if (start_threads() != 0) {
@@ -480,14 +482,16 @@ int32_t attr_public plugin_unload(int32_t argc, const char* argv[]) {
     return 0;
 }
 
+/* module_start/module_stop run from sceKernelLoadStartModule, before the
+ * plugin loader has called plugin_load. Doing any real work here (threads,
+ * sockets, file IO) crashes the host title, so keep them as no-ops. The
+ * loader starts us via plugin_load and stops us via plugin_unload. */
 int32_t attr_module_hidden module_start(int64_t argc, const void *args) {
     (void)argc; (void)args;
-    start_threads();
     return 0;
 }
 
 int32_t attr_module_hidden module_stop(int64_t argc, const void *args) {
     (void)argc; (void)args;
-    stop_threads();
     return 0;
 }

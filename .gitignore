@@ -3,3 +3,5 @@ lockall_plugin/build/
 *.oelf
 *.o
 *.so
+__pycache__/
+*.pyc
