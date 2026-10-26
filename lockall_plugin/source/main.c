@@ -80,12 +80,11 @@ static int           g_threads_started = 0;
  * resident inside whatever process we get injected into. */
 typedef int32_t (*fn_kill_app_t)(uint32_t appid, int32_t opt, int32_t method, int32_t reason);
 typedef int32_t (*fn_get_big_app_t)(void);
-typedef void    (*fn_go_home_t)(void);
 
-static fn_kill_app_t    p_KillApp    = NULL;
-static fn_get_big_app_t p_GetBigApp  = NULL;
-static fn_go_home_t     p_GoHome     = NULL;
-static int              g_sys_loaded = 0;
+static fn_kill_app_t    p_KillApp         = NULL;
+static fn_get_big_app_t p_GetBigApp       = NULL;
+static fn_get_big_app_t p_GetRunningBigApp = NULL;
+static int              g_sys_loaded      = 0;
 
 static void logf_(const char *fmt, ...);
 
@@ -98,10 +97,10 @@ static void load_system_service(void) {
     }
     sys_dynlib_dlsym(h, "sceSystemServiceKillApp", (void *)&p_KillApp);
     sys_dynlib_dlsym(h, "sceSystemServiceGetAppIdOfBigApp", (void *)&p_GetBigApp);
-    sys_dynlib_dlsym(h, "sceSystemServiceNavigateToGoHome", (void *)&p_GoHome);
+    sys_dynlib_dlsym(h, "sceSystemServiceGetAppIdOfRunningBigApp", (void *)&p_GetRunningBigApp);
     g_sys_loaded = 1;
-    logf_("system service resolved (kill=%p bigapp=%p home=%p)\n",
-          (void *)p_KillApp, (void *)p_GetBigApp, (void *)p_GoHome);
+    logf_("system service resolved (kill=%p bigapp=%p runbigapp=%p)\n",
+          (void *)p_KillApp, (void *)p_GetBigApp, (void *)p_GetRunningBigApp);
 }
 
 static void logf_(const char *fmt, ...) {
@@ -231,28 +230,45 @@ static int is_protected_process(void) {
 /* ------------------------------------------------------------------ */
 /* kicking the user out of the running game                           */
 /*                                                                    */
-/* The lock does NOT terminate the title: it sends the user back to    */
-/* the home screen (the game stays suspended in the background). The   */
-/* monitor keeps doing this while the lock is on, so re-opening the    */
-/* game just bounces the user home again.                              */
+/* We deliberately do NOT call sceSystemServiceNavigateToGoHome(): it  */
+/* makes SceShellUI run its PS-button "go home" flow, which calls      */
+/* SetForegroundUserId and throws 0x80960009 (no foreground user) ->   */
+/* the unhandled exception crashes the shell (CE-36329-3).             */
+/*                                                                    */
+/* Instead we issue the same clean close the system uses for its own   */
+/* "Close Application": sceSystemServiceKillApp(appid, -1, 0, 0). This */
+/* terminates the title and lands the user back on the home screen     */
+/* with no system error.                                               */
 /* ------------------------------------------------------------------ */
-static void exit_to_home(void) {
+static void enforce_lock(void) {
     load_system_service();
 
-    if (p_GoHome) {
-        p_GoHome();
-        logf_("navigated to the home screen\n");
-        return;
+    /* Inside a game the sceSystemServiceGetAppIdOf* queries fail with an
+     * LNC error (0x8094000f), so ask libkernel for our own app id instead. */
+    int32_t appid = 0;
+    OrbisAppInfo ai;
+    memset(&ai, 0, sizeof(ai));
+    int32_t airet = sceKernelGetAppInfo(getpid(), &ai);
+    if (airet == 0 && ai.AppId > 0)
+        appid = ai.AppId;
+    logf_("getappinfo pid=%d ret=0x%08x appid=0x%08x type=%d title=%s\n",
+          (int)getpid(), airet, appid, ai.AppType, ai.TitleId);
+
+    if (appid <= 0 && p_GetRunningBigApp) {
+        int32_t v = p_GetRunningBigApp();
+        if (v > 0) appid = v;
+    }
+    if (appid <= 0 && p_GetBigApp) {
+        int32_t v = p_GetBigApp();
+        if (v > 0) appid = v;
     }
 
-    /* last resort if the go-home entry point could not be resolved:
-     * method 0x20000 is the system's own "close, then show home" path. */
-    int32_t appid = p_GetBigApp ? p_GetBigApp() : -1;
     if (appid > 0 && p_KillApp) {
-        int32_t ret = p_KillApp((uint32_t)appid, 0, 0x20000, 0);
-        logf_("go-home unavailable, KillApp(0x%08x) = 0x%08x\n", appid, ret);
+        int32_t ret = p_KillApp((uint32_t)appid, -1, 0, 0);
+        logf_("closed app 0x%08x (KillApp ret 0x%08x)\n", appid, ret);
     } else {
-        logf_("no way to leave the game (go-home and kill both unavailable)\n");
+        logf_("cannot close app (appid=0x%08x kill=%p)\n",
+              appid, (void *)p_KillApp);
     }
 }
 
@@ -403,15 +419,14 @@ static void *monitor_thread(void *arg) {
     }
 
     while (g_running) {
-        if (load_locked()) {
-            if (self_is_game && !is_protected_process()) {
-                notify("Games are locked");
-                exit_to_home();
-                /* cooldown: avoid notification/go-home spam */
-                sceKernelUsleep(2000 * 1000);
-            }
+        if (load_locked() && self_is_game && !is_protected_process()) {
+            notify("Games are locked");
+            enforce_lock();
+            /* the title is normally terminated here; if it survived, back
+             * off so we never hammer the shell. */
+            sceKernelUsleep(1000 * 1000);
         }
-        sceKernelUsleep(500 * 1000);
+        sceKernelUsleep(250 * 1000);
     }
     return NULL;
 }

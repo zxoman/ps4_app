@@ -5,13 +5,33 @@ unlock **all** retail games on a jailbroken PS4 over Wi-Fi.
 
 - Plugin: background TCP server on port **9095** (not 9090 - that is GoldHEN's
   BinLoader), token authentication, on-screen notifications, and while locked it
-  **sends the user back to the home screen** (the game is suspended, not killed)
-  for any retail game (`CUSA*`). State persists across reboot/rest mode.
+  **cleanly closes** any retail game (`CUSA*`) with the system "Close
+  Application" call and returns the user to the home screen. State persists
+  across reboot/rest mode.
 - Client: `ps4lock.py lock|unlock|status`.
 
 > Firmware / GoldHEN used while writing this: **9.00 / GoldHEN 2.4b18.6**
 > (fill in your own). Everything below assumes a working GoldHEN with the
 > *Plugin Loader* enabled.
+
+> **PS5 / etaHEN:** the same idea is ported in
+> [`ps5_lockall_plugin/`](ps5_lockall_plugin/README.md). It is a persistent
+> etaHEN daemon, so the TCP server is always available and the FTP fallback is
+> not normally needed.
+
+### Windows deploy tool (`lockall-deploy.exe`)
+
+A small GUI that uploads the PS4 / PS5 plugin over FTP (and updates
+`plugins.ini` on PS4). Download the latest build from **Actions → Build
+Windows EXE → artifacts**, or from a GitHub Release.
+
+```bash
+# or run from source
+python3 client/deploy_plugin.py
+```
+
+The EXE is built automatically by `.github/workflows/build-exe.yml`
+(PyInstaller on `windows-latest`).
 
 ---
 
@@ -23,8 +43,11 @@ lockall_plugin/
   source/main.c                # the whole plugin
   config/lockall.ini           # example token file
   config/plugins.ini.example   # example plugins.ini snippet
+ps5_lockall_plugin/            # etaHEN daemon port
 client/
-  ps4lock.py                   # PC client
+  ps4lock.py                   # PC lock/unlock client
+  deploy_plugin.py             # GUI/CLI FTP deployer
+  plugins/                     # prebuilt .prx / .plugin bundled into the EXE
 README.md
 ```
 
@@ -43,18 +66,21 @@ or app you launch.
 - Only one process may bind TCP 9095; whichever instance starts first wins the
   listener. The others run the monitor only and retry the bind every ~3 s, so
   if the listener process exits another instance takes over automatically.
-- The **monitor** in each instance checks every 500 ms: if the state is
+- The **monitor** in each instance checks every 250 ms: if the state is
   *locked* **and** this process is a retail game (`CUSA*`), it shows
-  "Games are locked" and sends the user back to the home screen. Re-opening the
-  game just bounces the user home again while the lock is on.
+  "Games are locked" and cleanly closes the title with
+  `sceSystemServiceKillApp(appid, -1, 0, 0)` - the same call the system uses for
+  its own "Close Application". The user lands back on the home screen with no
+  system error; re-launching the game just closes it again while the lock is on.
+  Your own app id is read with `sceKernelGetAppInfo(getpid())` because the
+  `sceSystemServiceGetAppIdOf*` queries fail from inside a game (`0x8094000f`).
 
 **Limitation to be aware of:** because plugins only exist inside launched
-titles, the TCP server is reachable while a GoldHEN-injected title (a game or
-app) is running. If the console is sitting on the home screen with *nothing*
-launched and GoldHEN did not inject into the shell process, port 9095 will not
-answer. In that case open any app/game briefly to bring an instance (and the
-server) up. This is a GoldHEN plugin architecture constraint, not a bug in this
-plugin. See *Troubleshooting*.
+titles, the plugin's TCP server on 9095 is only reachable while a
+GoldHEN-injected title is running. While the console is *locked* nothing is
+listening (the game is closed at once). The PC client therefore falls back to
+GoldHEN's FTP server (always up) to read/write the state file, so lock/unlock
+still work from the home screen. See *Troubleshooting*.
 
 ---
 
@@ -154,6 +180,24 @@ Expected replies:
 | `status` | `locked` / `unlocked` |
 | bad token / bad command | `ERR` |
 
+### Automatic FTP fallback (important)
+
+The plugin's TCP server (9095) only lives **inside a running game**. While the
+console is *locked* every game is closed within ~100 ms, so nothing is
+listening on 9095 and you could never unlock. To avoid that trap the client
+falls back to **GoldHEN's FTP server** (`--ftp-port`, default `2121`,
+anonymous), which is always available: it simply writes
+
+    lock   -> /data/GoldHEN/lockall_state.txt = "1"
+    unlock -> /data/GoldHEN/lockall_state.txt = "0"
+
+so lock/unlock/status work from the home screen with no game running. The reply
+is suffixed `(via FTP)` when that path was used. You can also do it by hand with
+any FTP client (`curl -T state.txt ftp://<ps4>:2121/data/GoldHEN/lockall_state.txt`).
+
+> If you ever get stuck: FTP in and overwrite `/data/GoldHEN/lockall_state.txt`
+> with `0` (or delete it) - that is the whole lock state.
+
 ---
 
 ## Troubleshooting
@@ -171,11 +215,13 @@ Expected replies:
 
 ### "connection refused" from the client
 
-- The server only exists while a title that GoldHEN injected the plugin into
-  is running. Launch any game or app, then retry. (See the limitation above.)
-  Because the monitor kills a game within ~500 ms while locked, you may need to
-  retry `unlock` while a title is starting.
-- Verify the port: **9095**, not 9090 (GoldHEN BinLoader) or 9091.
+- This is expected while the console is locked: the TCP server only exists while
+  a GoldHEN-injected title is running, and a locked title is closed immediately.
+  The client handles this automatically by falling back to FTP (see above), so
+  `lock` / `unlock` / `status` still work. You only see a hard failure if the
+  FTP fallback also fails.
+- Verify the ports: plugin **9095**, FTP **2121** (not 9090 GoldHEN BinLoader
+  or 9091).
 - Confirm the PS4 and PC are on the same network and the PS4 has an IP
   (`Settings -> Network`). Some routers isolate wireless clients from each
   other ("AP isolation") - disable that or use Ethernet.
@@ -220,6 +266,17 @@ Expected replies:
   the raw `sceKernelOpen` / `sceKernelRead` / `sceKernelWrite` / `sceKernelClose`
   syscalls instead (the GoldHEN plugin loader does the same for its own
   `plugins.ini`).
+- **Do not use `sceSystemServiceNavigateToGoHome()` to eject a game.** It makes
+  `SceShellUI` run its PS-button "go home" flow, which calls
+  `SetForegroundUserId`; with no foreground PS4 user (`userId = ffffffff`,
+  ANONYMOUS) that throws `0x80960009`, the unhandled exception crashes the
+  shell, and the console shows **CE-36329-3**. Use a clean
+  `sceSystemServiceKillApp(appid, -1, 0, 0)` instead - it returns to the home
+  screen without touching the shell UI.
+- Inside a game, `sceSystemServiceGetAppIdOfBigApp()` /
+  `...GetAppIdOfRunningBigApp()` fail with an LNC error (`0x8094000f`). Get your
+  own app id with `sceKernelGetAppInfo(getpid(), &OrbisAppInfo).AppId` and pass
+  that to `KillApp`.
 
 ---
 
@@ -232,8 +289,12 @@ Expected replies:
   without crashing, logs `listening on port 9095`, and the client's
   `lock` / `unlock` / `status` commands all round-trip correctly (bad token →
   `ERR`). The state file persists.
-- Still unverified on hardware: the go-home enforcement against an actual
-  retail `CUSA*` game, rest-mode persistence, and thread teardown timing.
+- **Enforcement verified on real hardware** against a retail game
+  (`CUSA18740`): while locked, launching the game closes it cleanly
+  (`KillApp()` with `withSuspend`), focus returns to the shell, and there is
+  **no** `App Crash` / `CE-36329-3` in the kernel log. Lock/unlock/status also
+  verified over the FTP fallback from the home screen.
+- Still unverified on hardware: rest-mode persistence and thread teardown timing.
 
 If something misbehaves, the `[lockall]` klog lines will say what the plugin
 decided and which function pointers it resolved.

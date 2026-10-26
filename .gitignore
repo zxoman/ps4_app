@@ -1,7 +1,16 @@
 lockall_plugin/build/
+ps5_lockall_plugin/build/
 *.elf
 *.oelf
 *.o
 *.so
+*.plugin
+!client/plugins/
+!client/plugins/**
 __pycache__/
 *.pyc
+dist/
+build/
+*.spec
+.venv/
+venv/

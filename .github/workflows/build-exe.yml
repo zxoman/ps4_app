@@ -1,0 +1,67 @@
+name: Build Windows EXE
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install PyInstaller
+        run: python -m pip install --upgrade pip pyinstaller
+
+      - name: Build lockall-deploy.exe
+        shell: pwsh
+        run: |
+          $prx = "lockall_plugin/build/lockall.prx"
+          $plugin = "ps5_lockall_plugin/build/lockall_ps5.plugin"
+          if (-not (Test-Path $prx)) { $prx = "client/plugins/lockall.prx" }
+          if (-not (Test-Path $plugin)) { $plugin = "client/plugins/lockall_ps5.plugin" }
+          if (-not (Test-Path $prx)) { throw "missing PS4 plugin: lockall.prx" }
+          if (-not (Test-Path $plugin)) { throw "missing PS5 plugin: lockall_ps5.plugin" }
+
+          New-Item -ItemType Directory -Force -Path dist-plugins | Out-Null
+          Copy-Item $prx dist-plugins/lockall.prx
+          Copy-Item $plugin dist-plugins/lockall_ps5.plugin
+
+          pyinstaller `
+            --noconfirm `
+            --clean `
+            --onefile `
+            --name lockall-deploy `
+            --console `
+            --add-data "dist-plugins/lockall.prx;plugins" `
+            --add-data "dist-plugins/lockall_ps5.plugin;plugins" `
+            client/deploy_plugin.py
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lockall-deploy-windows
+          path: dist/lockall-deploy.exe
+
+      - name: Attach EXE to release
+        if: github.event_name == 'release'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: pwsh
+        run: |
+          gh release upload "${{ github.event.release.tag_name }}" `
+            dist/lockall-deploy.exe `
+            --clobber
