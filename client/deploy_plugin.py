@@ -45,6 +45,7 @@ def _find_plugin(filename, *rel_dirs):
     """Locate a plugin next to the exe, in the PyInstaller bundle, or in the repo."""
     candidates = [
         os.path.join(HERE, filename),
+        os.path.join(HERE, "plugins", filename),
         os.path.join(ROOT, filename),
         os.path.join(BUNDLE, "plugins", filename),
         os.path.join(BUNDLE, filename),

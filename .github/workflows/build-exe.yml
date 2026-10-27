@@ -3,7 +3,13 @@ name: Build Windows EXE
 on:
   push:
     branches: [master, main]
+    paths:
+      - "client/**"
+      - ".github/workflows/build-exe.yml"
   pull_request:
+    paths:
+      - "client/**"
+      - ".github/workflows/build-exe.yml"
   workflow_dispatch:
   release:
     types: [published]
@@ -29,12 +35,12 @@ jobs:
       - name: Build lockall-deploy.exe
         shell: pwsh
         run: |
-          $prx = "lockall_plugin/build/lockall.prx"
-          $plugin = "ps5_lockall_plugin/build/lockall_ps5.plugin"
-          if (-not (Test-Path $prx)) { $prx = "client/plugins/lockall.prx" }
-          if (-not (Test-Path $plugin)) { $plugin = "client/plugins/lockall_ps5.plugin" }
-          if (-not (Test-Path $prx)) { throw "missing PS4 plugin: lockall.prx" }
-          if (-not (Test-Path $plugin)) { throw "missing PS5 plugin: lockall_ps5.plugin" }
+          $prx = "client/plugins/lockall.prx"
+          $plugin = "client/plugins/lockall_ps5.plugin"
+          if (-not (Test-Path $prx)) { $prx = "lockall_plugin/build/lockall.prx" }
+          if (-not (Test-Path $plugin)) { $plugin = "ps5_lockall_plugin/build/lockall_ps5.plugin" }
+          if (-not (Test-Path $prx)) { throw "missing PS4 plugin: lockall.prx (commit client/plugins/)" }
+          if (-not (Test-Path $plugin)) { throw "missing PS5 plugin: lockall_ps5.plugin (commit client/plugins/)" }
 
           New-Item -ItemType Directory -Force -Path dist-plugins | Out-Null
           Copy-Item $prx dist-plugins/lockall.prx
@@ -44,17 +50,23 @@ jobs:
             --noconfirm `
             --clean `
             --onefile `
+            --windowed `
             --name lockall-deploy `
-            --console `
             --add-data "dist-plugins/lockall.prx;plugins" `
             --add-data "dist-plugins/lockall_ps5.plugin;plugins" `
             client/deploy_plugin.py
+
+          if (-not (Test-Path "dist/lockall-deploy.exe")) {
+            throw "PyInstaller did not produce dist/lockall-deploy.exe"
+          }
+          Get-Item dist/lockall-deploy.exe | Format-List Name, Length, LastWriteTime
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: lockall-deploy-windows
           path: dist/lockall-deploy.exe
+          if-no-files-found: error
 
       - name: Attach EXE to release
         if: github.event_name == 'release'
